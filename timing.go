@@ -78,6 +78,13 @@ func AbsSlotToEpoch(s Slot) Epoch {
 	return Epoch(int((s-FirstShelleySlot)/EpochLength) + int(FirstShelleyEpoch))
 }
 
+func AbsSlotToSlotInEpoch(s Slot) Slot {
+	if s < FirstShelleySlot {
+		return Slot(s % byronEpochLength)
+	}
+	return Slot(int((s - FirstShelleySlot) % EpochLength))
+}
+
 func EpochAndSlotToTime(e Epoch, s Slot) time.Time {
 	return time.Unix(int64(e)*EpochLength+int64(s), 0)
 }

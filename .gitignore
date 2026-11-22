@@ -1,2 +1,5 @@
-_c_libsodium_built/
+llt
 go-leaderlog-tool
+
+# old artifacts, experiments, trace logs — not part of the build
+unused/

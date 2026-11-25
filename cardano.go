@@ -12,25 +12,100 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	koios "github.com/cardano-community/koios-go-client/v4"
 	"github.com/shopspring/decimal"
 )
 
-// getEpochInfoForNonce fetches the active stake and epoch nonce for a given
-// epoch from Koios. The nonce is the hex-encoded 32-byte epoch nonce (eta0).
+// koiosDataSource is the default DataSource: the Koios REST API (v4 client).
+//
+// It exists to keep the consensus core free of data-access concerns: it feeds
+// checkSlotsInEpoch the epoch nonce and the (per-pool / total) active stake,
+// exactly as the free functions it replaced did.
+//
+// The KOIOS_API_URL environment variable overrides the host for *all* reads
+// (raw and typed), e.g. https://api.koios.io/api/v1.
+type koiosDataSource struct {
+	kc *koios.Client
+}
+
+var _ DataSource = (*koiosDataSource)(nil)
+
+// NewKoiosDataSource builds the koios client, applying the KOIOS_API_URL
+// override (if set) as client options so that the typed client and the raw
+// HTTP path below always agree on the host.
+func NewKoiosDataSource(ctx context.Context) (DataSource, error) {
+	opts, err := koiosOptionsFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	kc, err := koios.New(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("creating koios client: %w", err)
+	}
+	return &koiosDataSource{kc: kc}, nil
+}
+
+func (k *koiosDataSource) Name() string { return "koios" }
+
+func (k *koiosDataSource) Close() error { return nil }
+
+// koiosOptionsFromEnv turns KOIOS_API_URL (expected shape:
+// scheme://host[:port]/api/<version>) into koios client options.
+func koiosOptionsFromEnv() ([]koios.Option, error) {
+	raw := strings.TrimSpace(os.Getenv("KOIOS_API_URL"))
+	if raw == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parsing KOIOS_API_URL %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("KOIOS_API_URL %q: unsupported scheme %q", raw, u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return nil, fmt.Errorf("KOIOS_API_URL %q: missing host", raw)
+	}
+	var version string
+	if path := strings.Trim(u.Path, "/"); path != "" {
+		parts := strings.Split(path, "/")
+		if len(parts) != 2 || parts[0] != "api" {
+			return nil, fmt.Errorf("KOIOS_API_URL %q: path must be /api/<version>, got %q", raw, u.Path)
+		}
+		version = parts[1]
+	}
+	opts := []koios.Option{koios.Scheme(u.Scheme), koios.Host(host)}
+	if port := u.Port(); port != "" {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("KOIOS_API_URL %q: invalid port %q", raw, port)
+		}
+		opts = append(opts, koios.Port(uint16(n)))
+	}
+	if version != "" {
+		opts = append(opts, koios.APIVersion(version))
+	}
+	return opts, nil
+}
+
+// GetEpochInfo fetches the active stake and epoch nonce for a given epoch
+// from Koios. The nonce is the hex-encoded 32-byte epoch nonce (eta0).
 //
 // These two reads are done with a raw HTTP GET (rather than the koios-go-client
 // v4 GetEpochInfo/GetEpochParams helpers) because those helpers unconditionally
 // inject an "order=epoch_no.desc" query parameter, which the Koios v1 REST API
 // rejects when combined with an epoch filter ("column record.epoch_no does not
 // exist"). We reuse the client's own base URL so the host/version stay
-// consistent, and allow KOIOS_API_URL to override it.
-func getEpochInfoForNonce(ctx context.Context, kc *koios.Client, epochNo Epoch) (uint64, string, string, error) {
-	base := koiosBaseURL(kc)
+// consistent. Do not route these reads back through GetEpochInfo/GetEpochParams
+// — it will 400 again.
+func (k *koiosDataSource) GetEpochInfo(ctx context.Context, epochNo int) (EpochInfo, error) {
+	base := koiosBaseURL(k.kc)
 	ep := strconv.FormatInt(int64(epochNo), 10)
 
-	var activeStake uint64
+	var info EpochInfo
 	{
 		var out []struct {
 			ActiveStake string `json:"active_stake"`
@@ -39,19 +114,18 @@ func getEpochInfoForNonce(ctx context.Context, kc *koios.Client, epochNo Epoch) 
 			"select":    []string{"active_stake"},
 			"_epoch_no": []string{ep},
 		}, &out); err != nil {
-			return 0, "", "", err
+			return info, err
 		}
 		if len(out) == 0 {
-			return 0, "", "", fmt.Errorf("no active_stake for epoch %d", epochNo)
+			return info, fmt.Errorf("no active_stake for epoch %d", epochNo)
 		}
 		stake, err := stakeUint64FromStr(out[0].ActiveStake)
 		if err != nil {
-			return 0, "", "", fmt.Errorf("active_stake for epoch %d: %w", epochNo, err)
+			return info, fmt.Errorf("active_stake for epoch %d: %w", epochNo, err)
 		}
-		activeStake = stake
+		info.ActiveStake = stake
 	}
 
-	var blockHash, nonce string
 	{
 		var out []struct {
 			BlockHash string `json:"block_hash"`
@@ -61,24 +135,61 @@ func getEpochInfoForNonce(ctx context.Context, kc *koios.Client, epochNo Epoch) 
 			"select":    []string{"block_hash,nonce"},
 			"_epoch_no": []string{ep},
 		}, &out); err != nil {
-			return 0, "", "", err
+			return info, err
 		}
 		if len(out) == 0 {
-			return 0, "", "", fmt.Errorf("no nonce for epoch %d", epochNo)
+			return info, fmt.Errorf("no nonce for epoch %d", epochNo)
 		}
-		blockHash = out[0].BlockHash
-		nonce = out[0].Nonce
+		info.BlockHash = out[0].BlockHash
+		info.Nonce = out[0].Nonce
 	}
-	return activeStake, blockHash, nonce, nil
+	return info, nil
 }
 
-// koiosBaseURL returns the Koios REST base URL, defaulting to the configured
-// client but allowing an override via KOIOS_API_URL (e.g. the mainnet host
-// https://api.koios.io/api/v1/).
-func koiosBaseURL(kc *koios.Client) string {
-	if u := os.Getenv("KOIOS_API_URL"); u != "" {
-		return strings.TrimRight(u, "/") + "/"
+func (k *koiosDataSource) GetPoolStakeForEpoch(ctx context.Context, epochNo int, id string) (uint64, error) {
+	epochNo_ := koios.EpochNo(epochNo)
+	opts := k.kc.NewRequestOptions()
+	opts.QuerySet("select", "active_stake")
+	r, err := k.kc.GetPoolHistory(ctx, koios.PoolID(id), epochNo_, opts)
+	if err != nil {
+		return 0, fmt.Errorf("koios pool_history for epoch %d: %w", epochNo, err)
 	}
+	if len(r.Data) == 0 {
+		// Unknown pool id, or a pool with no history in that epoch.
+		return 0, fmt.Errorf("no pool history for pool %s in epoch %d", id, epochNo)
+	}
+	return stakeUint64(r.Data[0].ActiveStake)
+}
+
+func (k *koiosDataSource) GetStakeSnapshots(ctx context.Context, id string) (map[string]PoolStakeSnapshot, error) {
+	r, err := k.kc.GetPoolStakeSnapshot(ctx, koios.PoolID(id), nil)
+	if err != nil {
+		return nil, fmt.Errorf("koios pool_stake_snapshot for pool %s: %w", id, err)
+	}
+	if len(r.Data) == 0 {
+		return nil, fmt.Errorf("no stake snapshots for pool %s (unknown pool id?)", id)
+	}
+	m := make(map[string]PoolStakeSnapshot, len(r.Data))
+	for _, s := range r.Data {
+		m[s.Snapshot] = PoolStakeSnapshot{
+			EpochNo:     int(s.EpochNo),
+			ActiveStake: uint64FromSnap(s.ActiveStake),
+			PoolStake:   uint64FromSnap(s.PoolStake),
+			Nonce:       s.Nonce,
+		}
+	}
+	return m, nil
+}
+
+// GetCandidateNonce returns the candidate nonce (eta0) for the upcoming epoch
+// from the public f2lb HTTP endpoint, which computes it from the evolving
+// nonce (the Koios API itself does not expose it).
+func (k *koiosDataSource) GetCandidateNonce(ctx context.Context) (string, error) {
+	return eta0FromHTTP(ctx)
+}
+
+// koiosBaseURL returns the Koios REST base URL of the configured client.
+func koiosBaseURL(kc *koios.Client) string {
 	return strings.TrimRight(kc.BaseURL(), "/") + "/"
 }
 
@@ -107,55 +218,43 @@ func koiosGetJSON(ctx context.Context, base, path string, query url.Values, out 
 	return json.Unmarshal(body, out)
 }
 
-func getPoolStakeForEpoch(ctx context.Context, kc *koios.Client, epochNo int, id string) (uint64, error) {
-	epochNo_ := koios.EpochNo(epochNo)
-	opts := kc.NewRequestOptions()
-	opts.QuerySet("select", "active_stake")
-	r, err := kc.GetPoolHistory(ctx, koios.PoolID(id), epochNo_, opts)
+// eta0URL is the public endpoint serving the candidate nonce (eta0) for the
+// upcoming epoch. It is a variable (not a constant) so tests can point it at
+// a local httptest server.
+var eta0URL = "https://f2lb.bardels.me/api/v0/nonce.next"
+
+// eta0Timeout bounds a single eta0 fetch.
+var eta0Timeout = 15 * time.Second
+
+// eta0FromHTTP returns the candidate nonce (eta0) for the upcoming epoch.
+// When the endpoint has not yet produced a nonce for the upcoming epoch an
+// empty string is returned (that is not an error).
+func eta0FromHTTP(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, eta0Timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, eta0URL, nil)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	return stakeUint64(r.Data[0].ActiveStake)
-}
-
-func getStakeSnapshotForPool(ctx context.Context, kc *koios.Client, id string) map[string]koios.PoolSnapshot {
-	r, _ := kc.GetPoolStakeSnapshot(ctx, koios.PoolID(id), nil)
-	m := make(map[string]koios.PoolSnapshot)
-	for _, s := range r.Data {
-		m[s.Snapshot] = s
-	}
-	return m
-}
-
-// getEta0 returns the candidate nonce (eta0) for the upcoming epoch.
-//
-// The cardano-node CLI query used to be supported here, but it required the
-// cardano-go dependency and a running node. It is now obtained from a public
-// HTTP endpoint; when that endpoint has not yet produced a nonce, an empty
-// string is returned.
-func getEta0() string {
-	if os.Getenv("CARDANO_NODE_SOCKET_PATH") == "" {
-		return eta0FromHTTP()
-	}
-	// A node is configured but we no longer query it; fall back to HTTP so the
-	// behaviour is well-defined rather than failing.
-	return eta0FromHTTP()
-}
-
-func eta0FromHTTP() string {
-	res, err := http.Get("https://f2lb.bardels.me/api/v0/nonce.next")
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		panic(err)
-	}
-	if res.StatusCode == http.StatusNotFound {
-		return ""
+		return "", fmt.Errorf("fetching %s: %w", eta0URL, err)
 	}
 	defer res.Body.Close()
+	if res.StatusCode == http.StatusNotFound {
+		// The nonce for the upcoming epoch has not been published yet.
+		return "", nil
+	}
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		return "", fmt.Errorf("%s: HTTP %d: %s", eta0URL, res.StatusCode, strings.TrimSpace(string(body)))
+	}
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		panic(err)
+		return "", fmt.Errorf("reading %s response: %w", eta0URL, err)
 	}
-	return strings.TrimSpace(string(b))
+	return strings.TrimSpace(string(b)), nil
 }
 
 // nonceBytes decodes a hex-encoded 32-byte epoch nonce, tolerating a trailing

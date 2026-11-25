@@ -1,8 +1,11 @@
 package main
 
 import (
+	"errors"
 	"math/big"
+	"strings"
 	"testing"
+	"time"
 
 	consensus "github.com/blinklabs-io/gouroboros/consensus"
 	"github.com/blinklabs-io/gouroboros/vrf"
@@ -176,6 +179,63 @@ func TestFullStakeF1Unconditional(t *testing.T) {
 		if !ok {
 			t.Errorf("f=1 full stake: slot %d not eligible, want true", slot)
 		}
+	}
+}
+
+// failingVRFSigner implements consensus.VRFSigner and fails every Prove, to
+// exercise the fail-fast path of the slot sweep.
+type failingVRFSigner struct{}
+
+func (failingVRFSigner) Prove(input []byte) ([]byte, []byte, error) {
+	return nil, nil, errors.New("injected prove failure")
+}
+
+func (failingVRFSigner) PublicKey() []byte { return nil }
+
+// TestCheckSlotsInEpochAbortsOnSlotError: a slot evaluation failure must
+// surface as an error (identifying the slot and stage), never as a silently
+// truncated leader log.
+func TestCheckSlotsInEpochAbortsOnSlotError(t *testing.T) {
+	origTZ, origPF := tzLoc, parallelFactor
+	tzLoc, parallelFactor = time.UTC, 4
+	defer func() { tzLoc, parallelFactor = origTZ, origPF }()
+
+	err := checkSlotsInEpoch(
+		300, int(GetFirstSlotOfEpoch(Epoch(300))),
+		1_000_000, 1_000_000_000,
+		strings.Repeat("ab", 32), big.NewRat(1, 20), consensus.ConsensusModeCPraos,
+		failingVRFSigner{},
+	)
+	if err == nil {
+		t.Fatal("want error when every slot's VRF prove fails")
+	}
+	if !strings.Contains(err.Error(), "VRF prove") || !strings.Contains(err.Error(), "slot ") {
+		t.Errorf("error should identify the failing slot and stage, got: %v", err)
+	}
+
+	// A non-positive parallel-factor must be clamped, not panic.
+	parallelFactor = -2
+	if err := checkSlotsInEpoch(
+		300, int(GetFirstSlotOfEpoch(Epoch(300))),
+		1_000_000, 1_000_000_000,
+		strings.Repeat("ab", 32), big.NewRat(1, 20), consensus.ConsensusModeCPraos,
+		failingVRFSigner{},
+	); err == nil {
+		t.Error("want error with clamped negative parallel-factor too")
+	}
+}
+
+// TestCheckSlotsInEpochRejectsPreShelley: pre-Shelley (Byron) epochs have no
+// VRF leader log; asking for one must be an error, not wrong output.
+func TestCheckSlotsInEpochRejectsPreShelley(t *testing.T) {
+	err := checkSlotsInEpoch(
+		100, 0, // Byron epoch: first slot would be 0
+		1_000_000, 1_000_000_000,
+		strings.Repeat("ab", 32), big.NewRat(1, 20), consensus.ConsensusModeCPraos,
+		failingVRFSigner{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "pre-Shelley") {
+		t.Fatalf("want pre-Shelley error, got: %v", err)
 	}
 }
 

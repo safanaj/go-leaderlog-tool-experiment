@@ -48,15 +48,21 @@ The leader test is `gouroboros/consensus`:
 `f` (active slot coefficient) **must be an exact `*big.Rat`** (default `1/20`),
 never a float. This matters for exact reproduction.
 
-## Source files (the build is just these four + module files)
+## Source files (the build is these + module files)
 
 | File | Responsibility |
 |------|----------------|
-| `main.go` | CLI flags, orchestration. `checkSlotsInEpoch` builds one `LeaderEligibility` and, per slot, does `vrfInputForMode → signer.Prove → CheckVRFOutput` with a bounded worker pool. Emits a JSON `leaderSummary` with `assignedSlots`, `Ideal`, `Performance`. |
-| `cardano.go` | Koios (v4) data access + nonce/VRF-hex helpers. **See the koios gotcha below.** |
+| `datasource.go` | The `DataSource` interface (`GetEpochInfo`/`GetPoolStakeForEpoch`/`GetStakeSnapshots`/`GetCandidateNonce`/`Name`/`Close`) + the `EpochInfo`/`PoolStakeSnapshot` types. All data access goes through it. |
+| `main.go` | CLI flags, orchestration. `run()` (called by `main`, which maps errors to exit status 1 + stderr) drives everything through a `DataSource` built by `newDataSource` (`-data-source koios\|db\|node`). `checkSlotsInEpoch` builds one `LeaderEligibility` and, per slot, does `vrfInputForMode → signer.Prove → CheckVRFOutput` with a bounded worker pool; any slot-level error fails the whole run (first error wins) so a transient failure can never silently drop an assigned slot. Emits a JSON `leaderSummary` with `assignedSlots`, `Ideal`, `Performance`. |
+| `cardano.go` | `koiosDataSource` (default source): the Koios (v4) data access + nonce/VRF-hex helpers. **See the koios gotchas below.** |
+| `db.go` | `dbDataSource`: reads the inputs directly from a cexplorer (db-sync) Postgres DB over client-cert TLS (the verified SQL from PLAN.md §1). |
+| `node.go` | `nodeSource`: a running cardano-node's N2C socket via gouroboros `localstatequery` (tip-derived: serves the current epoch + the three chain-dep-state nonces only). |
 | `timing.go` | Pure slot↔epoch↔time math. Constants: `systemStartUnixEpoch=1506203091`, `EpochLength=432000`, `FirstShelleyEpoch=208`, `SlotInEpochForNextNonce=302400`. |
 | `vrf.go` | `vrfSeedFromCborHex` — extracts the 32-byte VRF seed from the `-vrf-skey-cborhex` input (bare 32-byte, `0x5820` bytestring, or `0x839820` 3-tuple). Pure-Go VRF (no cgo). |
-| `main_test.go` | Unit tests: `parseRat`, `parseMode`, `vrfSeedFromCborHex`, the mode-aware VRF input, and a parity test asserting the `Prove`+`CheckVRFOutput` pipeline agrees with `IsSlotLeaderFromComponentsWithMode`. |
+| `main_test.go` | Unit tests: `parseRat`, `parseMode`, `vrfSeedFromCborHex`, the mode-aware VRF input, a parity test asserting the `Prove`+`CheckVRFOutput` pipeline agrees with `IsSlotLeaderFromComponentsWithMode`, and fail-fast tests for the slot sweep (injected `Prove` failure, pre-Shelley epoch rejection, clamped negative `-parallel-factor`). |
+| `cardano_test.go` | Unit tests for `eta0FromHTTP` (httptest server: 200 trim, 404 → "not yet", 5xx/transport/timeout → error, never a panic). |
+| `koios_test.go` | End-to-end tests of `koiosDataSource` against an httptest Koios fixture (raw epoch reads, typed pool reads, `KOIOS_API_URL` option mapping, `parseNetwork`). |
+| `db_test.go` | `checkDBCerts` TLS-material validation + `newDataSource` selection errors (no live DB needed). |
 
 `go build ./...` ignores `unused/` (its nested `test_rs` has its own `go.mod`).
 
@@ -74,24 +80,44 @@ make run ARGS="--help"
 make clean
 ```
 
-`run_tests.sh` is a CI-style wrapper (same checks + an opt-in live Koios smoke
-test). Env knobs: `SMOKE_EPOCH`, `SMOKE_POOL`, `SMOKE_VRF_SEED`, `KOIOS_API_URL`.
+`run_tests.sh` is a CI-style wrapper (same checks + opt-in live smoke tests:
+Koios, db parity, and node). Env knobs: `SMOKE_EPOCH`, `SMOKE_POOL`,
+`SMOKE_VRF_SEED`, `KOIOS_API_URL`, `SMOKE_DB=1` + `SMOKE_DB_{CERT,KEY,CA}`
+(+ optional `SMOKE_DB_DSN`, `SMOKE_DB_EPOCH`), `SMOKE_NODE_SOCKET`.
 
 CLI flags (see `llt -h`): `-vrf-skey-cborhex`, `-pool-id-bech32`, `-f`
 (rational, default `1/20`), `-consensus` (`cpraos|tpraos|praos`, default
 `cpraos`), `-epoch-no`, `-all|-prev|-current|-next`, `-only-nonce`,
-`-parallel-factor`, `-tz`.
+`-parallel-factor`, `-tz`, and the data-source flags below.
 
 Quirky flag interaction (intentional, pre-existing): if `-prev` or `-next` is
 set without `-all`, `-current` is disabled.
 
+## Data sources (`-data-source`)
+
+All external inputs flow through the `DataSource` interface (`datasource.go`).
+The consensus core never changes — only the inputs vary.
+
+| Source | Flag | What it is / limitations |
+|--------|------|---------------------------|
+| `koios` (default) | — | Koios REST API (v4 client). The candidate nonce for `-next` comes from the `f2lb.bardels.me` HTTP endpoint (Koios does not expose it). |
+| `db` | `-db-dsn` (default: the `marge.bardels.me` cexplorer DSN), `-db-cert-file`/`-db-key-file`/`-db-ca-cert-file` (all three **required**; env `DB_DSN`, `DB_CERT_FILE`, `DB_KEY_FILE`, `DB_CA_CERT_FILE`) | cexplorer (cardano-db-sync) Postgres, client-certificate TLS. Uses the SQL verified in PLAN.md §1/§11. **Its candidate nonce only exists once the upcoming epoch actually starts** (epoch_param's E+1 row) — `-next` before the boundary errors "not yet available"; use `koios`/`node` for an early candidate nonce. |
+| `node` | `-node-socket` (**required**; env `NODE_SOCKET`), `-node-network` (`mainnet`\|`preprod`\|`preview`, env `NODE_NETWORK`) | A running cardano-node's N2C Unix socket via gouroboros `localstatequery` (no TLS — N2C is local-only). **Tip-derived**: serves the current epoch end-to-end (Set nonce + tip pool distribution) and the chain-dep-state nonces (Go/Set/Mark for `-only-nonce`), but **not** `-epoch-no`, and `-prev`/`-next` full runs fail loudly on the missing Go/Mark stake snapshots. The tip snapshot is fetched once per process (all methods read one consistent view). |
+
+Parity (verified 2026-11, `run_tests.sh` + PLAN.md §5 step 7): koios == db for
+a past epoch (full JSON diff), and node == db == koios for the current epoch.
+
 ## Dependencies (and why each exists)
 
 - `github.com/blinklabs-io/gouroboros v0.220.4` — **the correctness core**:
-  `consensus` (E34 + leader eligibility + pure-Go VRF signer) and `vrf`
-  (`MkInputVrf`/`MkSeedTPraos`/`SeedL`). Pin to this version.
+  `consensus` (E34 + leader eligibility + pure-Go VRF signer), `vrf`
+  (`MkInputVrf`/`MkSeedTPraos`/`SeedL`), and `localstatequery` + `ledger/common`
+  (`NewPoolIdFromBech32`) for the node source. Pin to this version.
 - `github.com/cardano-community/koios-go-client/v4` — fetch nonce, active stake,
   pool stake from the Koios REST API.
+- `github.com/jackc/pgx/v5` (pgxpool + stdlib) — the cexplorer Postgres source.
+  Note: closing the `sql.DB` from `stdlib.OpenDBFromPool` does **not** close the
+  pool — `dbDataSource.Close` closes both.
 - `github.com/shopspring/decimal` — parse Koios stake fields into `uint64`.
 - `github.com/spf13/pflag` — flag parsing.
 
@@ -101,21 +127,25 @@ set without `-all`, `-current` is disabled.
    rejects when combined with an epoch filter
    (`"column record.epoch_no does not exist"` → HTTP 400). This breaks
    `GetEpochInfo`/`GetEpochParams` and cannot be suppressed through the public
-   client API. **Workaround already in `cardano.go`:** `getEpochInfoForNonce`
+   client API. **Workaround in `cardano.go`:** `koiosDataSource.GetEpochInfo`
    fetches `epoch_info`/`epoch_params` via raw HTTP (`koiosGetJSON`) that omits
-   `order`, reusing `kc.BaseURL()`. The pool-stake calls
-   (`GetPoolStakeSnapshot`, `GetPoolHistory` in `pool.go`) do **not** inject
-   `order`, so they keep using the typed client. Don't "fix" this by routing the
-   epoch reads back through `GetEpochInfo`/`GetEpochParams` — it will 400 again.
+   `order`, reusing the client's own base URL. The pool-stake calls
+   (`GetPoolStakeSnapshot`, `GetPoolHistory`) do **not** inject `order`, so they
+   keep using the typed client. Don't "fix" this by routing the epoch reads back
+   through `GetEpochInfo`/`GetEpochParams` — it will 400 again.
 
-2. **Host selection / network.** `koios.New()` defaults to `api.koios.rest`,
-   which currently serves **testnet-style** data in this environment
-   (epoch ~560, ~22 M ADA active stake). Mainnet is `api.koios.io/api/v1`
-   (not reachable from this sandbox). Override with `KOIOS_API_URL=https://api.koios.io/api/v1`.
-   For mainnet, confirm epoch numbers before trusting output.
+2. **Host selection / network.** `koios.New()` defaults to `api.koios.rest`
+   (which currently serves mainnet data from this sandbox). Override with
+   `KOIOS_API_URL=https://api.koios.io/api/v1` — it is parsed into client
+   options in `NewKoiosDataSource`, so it applies to **both** the raw HTTP
+   reads and the typed client (a single host per run; don't reintroduce a
+   split where some reads ignore the override). The URL must have the shape
+   `scheme://host[:port]/api/<version>`. Confirm epoch numbers before trusting
+   output.
 
-3. **`--epoch-no` / `--only-nonce` need network.** With no reachable Koios host
-   they fail with HTTP errors (not a bug in the consensus path).
+3. **`--epoch-no` / `--only-nonce` need network** (koios/db) or a live node
+   socket (node). With no reachable host they fail with transport errors (not
+   a bug in the consensus path).
 
 4. **`f` is exact.** Keep `parseRat` returning `*big.Rat`; never substitute a
    float — that reintroduces the rounding divergence this project fixed.
@@ -137,6 +167,12 @@ set without `-all`, `-current` is disabled.
   `build_libsodium_helper.go`, the `echovl/cardano-go` fork dependency, and the
   node-CLI `getEta0` path (replaced by `eta0FromHTTP`, `f2lb.bardels.me`).
 - **Koios upgraded v3 → v4** (this added the `order` workaround above).
+- **Data sources abstracted** (PLAN.md): all external reads now go through the
+  `DataSource` interface — koios (default, unchanged output), a cexplorer
+  Postgres source (`db`, pgx/v5 + client-cert TLS, the verified SQL), and a
+  node N2C source (`node`, gouroboros `localstatequery`, tip-derived). The
+  E34/VRF/`f`-rational code did not change; koios↔db↔node parity was verified
+  by full-JSON diffs (see "Data sources" above).
 
 ## `unused/` (gitignored; ~1.5 GB, not part of the build)
 
@@ -166,10 +202,10 @@ delete if you want a leaner clone.
 
 - **Golden-vector parity test:** add a test comparing `llt` output for a fixed
   `(pool, nonce, f, epoch)` against a recorded `cncli` result (currently we only
-  assert internal consistency with `IsSlotLeaderFromComponentsWithMode`).
-- **Mainnet smoke:** run `make ci` + `SMOKE_EPOCH=... KOIOS_API_URL=https://api.koios.io/api/v1 ./run_tests.sh`
-  from a host that can reach mainnet.
+  assert internal consistency with `IsSlotLeaderFromComponentsWithMode` and
+  cross-source parity).
 - Decide whether the koios host should be a CLI flag (`-koios-url`) instead of /
   in addition to the `KOIOS_API_URL` env var.
-- `eta0FromHTTP` currently `panic`s on transport error; convert to a returned
-  error for cleaner CLI UX.
+- The db source's `-next` needs the epoch boundary (no early candidate nonce);
+  consider computing it from the DB's evolving-nonce data or falling back to the
+  node/koios source when `-data-source db -next` is asked for early.

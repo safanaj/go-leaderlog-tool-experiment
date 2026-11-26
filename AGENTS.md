@@ -58,7 +58,7 @@ never a float. This matters for exact reproduction.
 | `db.go` | `dbDataSource`: reads the inputs directly from a cexplorer (db-sync) Postgres DB over client-cert TLS (the verified SQL from PLAN.md §1). |
 | `node.go` | `nodeSource`: a running cardano-node's N2C socket via gouroboros `localstatequery` (tip-derived: serves the current epoch + the three chain-dep-state nonces only). |
 | `timing.go` | Pure slot↔epoch↔time math. Constants: `systemStartUnixEpoch=1506203091`, `EpochLength=432000`, `FirstShelleyEpoch=208`, `SlotInEpochForNextNonce=302400`. |
-| `vrf.go` | `vrfSeedFromCborHex` — extracts the 32-byte VRF seed from the `-vrf-skey-cborhex` input (bare 32-byte, `0x5820` bytestring, or `0x839820` 3-tuple). Pure-Go VRF (no cgo). |
+| `vrf.go` | `vrfSeedFromCborHex` — extracts the 32-byte VRF seed from the `-vrf-skey-cborhex` input (bare 32-byte, `0x5820` bytestring, `0x5840` 64-byte extended-key bytestring i.e. modern `VrfSigningKey_PraosVRF`, or `0x839820` 3-tuple). Pure-Go VRF (no cgo). |
 | `main_test.go` | Unit tests: `parseRat`, `parseMode`, `vrfSeedFromCborHex`, the mode-aware VRF input, a parity test asserting the `Prove`+`CheckVRFOutput` pipeline agrees with `IsSlotLeaderFromComponentsWithMode`, and fail-fast tests for the slot sweep (injected `Prove` failure, pre-Shelley epoch rejection, clamped negative `-parallel-factor`). |
 | `cardano_test.go` | Unit tests for `eta0FromHTTP` (httptest server: 200 trim, 404 → "not yet", 5xx/transport/timeout → error, never a panic). |
 | `koios_test.go` | End-to-end tests of `koiosDataSource` against an httptest Koios fixture (raw epoch reads, typed pool reads, `KOIOS_API_URL` option mapping, `parseNetwork`). |
@@ -150,7 +150,7 @@ a past epoch (full JSON diff), and node == db == koios for the current epoch.
 4. **`f` is exact.** Keep `parseRat` returning `*big.Rat`; never substitute a
    float — that reintroduces the rounding divergence this project fixed.
 
-5. **VRF key parsing** handles three CBOR shapes (see `vrf.go`); if a new shape
+5. **VRF key parsing** handles four CBOR shapes (see `vrf.go`); if a new shape
    appears, add a case there, not in the consensus call.
 
 ## History (the design rationale — don't regress this)

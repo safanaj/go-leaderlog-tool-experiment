@@ -69,6 +69,18 @@ func TestVrfSeedFromCborHex(t *testing.T) {
 	} else if string(got) != string(seed) {
 		t.Errorf("bytstring seed mismatch")
 	}
+	// CBOR extended-key byte string: 0x58 0x40 <seed 32> <public key 32>,
+	// the modern cardano-cli "VrfSigningKey_PraosVRF" shape.
+	pk, _, err := vrf.KeyGen(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ext := append(append([]byte{0x58, 0x40}, seed...), pk...)
+	if got, err := vrfSeedFromCborHex(encodeHex(ext)); err != nil {
+		t.Fatal(err)
+	} else if string(got) != string(seed) {
+		t.Errorf("extended-key seed mismatch")
+	}
 	// CBOR 3-tuple: 0x83 0x98 0x20 <32-byte seed> ...
 	tuple := append([]byte{0x83, 0x98, 0x20}, seed...)
 	if got, err := vrfSeedFromCborHex(encodeHex(tuple)); err != nil {
